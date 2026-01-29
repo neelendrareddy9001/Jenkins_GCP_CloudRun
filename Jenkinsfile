@@ -1,143 +1,141 @@
 pipeline {
     agent any
+
     tools {
-	jdk 'java17015'
-	maven 'maven387'
+        jdk 'java17'
+        maven 'maven3'
     }
+
     environment {
-	SONAR_SCANNER_HOME = tool 'sonar7'
-	IMAGE_NAME = "java-app"
+        SONAR_SCANNER_HOME = tool 'sonar7'
+
+        IMAGE_NAME = "java-app"
         IMAGE_TAG = "${BUILD_NUMBER}"
-	GCP_PROJECT_ID = "focal-dock-440200-u5"
-	FULL_IMAGE_NAME = "us-docker.pkg.dev/${GCP_PROJECT_ID}/java-app-repo-02/${IMAGE_NAME}:${IMAGE_TAG}"
-	SERVICE_NAME = "java-app-service"
-	REGION = "us-central1"
+
+        GCP_PROJECT_ID = "focal-dock-440200-u5"
+        ARTIFACT_REPO = "java-app-repo-02"
+        REGION = "us-central1"
+
+        FULL_IMAGE_NAME = "us-docker.pkg.dev/${GCP_PROJECT_ID}/${ARTIFACT_REPO}/${IMAGE_NAME}:${IMAGE_TAG}"
+        SERVICE_NAME = "java-app-service"
     }
+
     stages {
-        stage('Initialize Pipeline'){
+
+        stage('Initialize') {
             steps {
-                echo 'Initializing Pipeline ...'
-		sh 'java -version'
-		sh 'mvn -version'
+                echo 'Initializing pipeline...'
+                sh 'java -version'
+                sh 'mvn -version'
+                sh 'docker --version'
+                sh 'gcloud --version'
             }
         }
-        stage('Checkout GitHub Codes'){
+
+        stage('Checkout Source') {
             steps {
-                echo 'Checking out GitHub Codes ...'
-		checkout scmGit(branches: [[name: '*/main']], extensions: [], userRemoteConfigs: [[credentialsId: 'jenkins-gcp', url: 'https://github.com/iQuantC/Jenkins_GCP_CloudRun.git']])
+                checkout scmGit(
+                    branches: [[name: '*/main']],
+                    userRemoteConfigs: [[
+                        credentialsId: 'jenkins-gcp',
+                        url: 'https://github.com/iQuantC/Jenkins_GCP_CloudRun.git'
+                    ]]
+                )
             }
         }
-        stage('Maven Build'){
+
+        stage('Build with Maven') {
             steps {
-                echo 'Building Java App with Maven'
-		sh 'mvn clean package'
+                sh 'mvn clean package -DskipTests'
             }
         }
-        stage('JUnit Test of Java App'){
+
+        stage('JUnit Tests') {
             steps {
-                echo 'JUnit Testing'
-		sh 'mvn test'
+                sh 'mvn test'
             }
         }
-        stage('SonarQube Analysis'){
+
+        stage('SonarQube Analysis') {
             steps {
-                echo 'Running Static Code Analysis with SonarQube'
-		withCredentials([string(credentialsId: 'sonartoken', variable: 'sonarToken')]) {
-   			withSonarQubeEnv('sonar') {
-				sh '''
-					${SONAR_SCANNER_HOME}/bin/sonar-scanner \
-  					-Dsonar.projectKey=jenkinsgcp \
-  					-Dsonar.sources=. \
-  					-Dsonar.host.url=http://172.18.0.3:9000 \
-       					-Dsonar.java.binaries=target/classes \
-  					-Dsonar.token=$sonarToken
-    				'''
-			}
-		}
+                withCredentials([string(credentialsId: 'sonartoken', variable: 'SONAR_TOKEN')]) {
+                    withSonarQubeEnv('sonar') {
+                        sh """
+                        ${SONAR_SCANNER_HOME}/bin/sonar-scanner \
+                          -Dsonar.projectKey=jenkinsgcp \
+                          -Dsonar.sources=. \
+                          -Dsonar.java.binaries=target/classes \
+                          -Dsonar.token=$SONAR_TOKEN
+                        """
+                    }
+                }
             }
         }
-        stage('Trivy FS Scan'){
+
+        stage('Trivy File System Scan') {
             steps {
-                echo 'Scanning File System with Trivy FS ...'
-		sh 'trivy fs --format table -o FSScanReport.html'
+                sh 'trivy fs . --severity HIGH,CRITICAL --format table -o fs-scan.txt'
             }
         }
-        stage('Build & Tag Docker Image'){
+
+        stage('Build Docker Image') {
             steps {
-                echo 'Building the Java App Docker Image'
-		script {
-			sh "docker build -t ${IMAGE_NAME}:${IMAGE_TAG} ."
-		}
+                sh "docker build -t ${IMAGE_NAME}:${IMAGE_TAG} ."
             }
         }
-        stage('Trivy Security Scan'){
+
+        stage('Trivy Image Scan') {
             steps {
-                echo 'Scanning Docker Image with Trivy'
-		sh '''
-  			trivy --severity HIGH,CRITICAL --cache-dir ${WORKSPACE}/.trivy-cache --no-progress --format table -o trivyFSScanReport.html image ${IMAGE_NAME}:${IMAGE_TAG}
-     		'''
+                sh """
+                trivy image ${IMAGE_NAME}:${IMAGE_TAG} \
+                  --severity HIGH,CRITICAL \
+                  --no-progress \
+                  --format table \
+                  -o image-scan.txt
+                """
             }
         }
-	stage('Authenticate with GCP, Tag & Push to Artifact Registry') {
+
+        stage('Authenticate & Push to Artifact Registry') {
             steps {
-		echo 'Authenticate with GCP, tag and Push Image to Artifact Registry'
-		withCredentials([file(credentialsId: 'gcpjmsa', variable: 'gcpCred')]) {
-    			withEnv(["GOOGLE_APPLICATION_CREDENTIALS=$gcpCred"]) {
-				sh '''
-					echo Activating GCP service account...
-                    			gcloud auth activate-service-account --key-file=$GOOGLE_APPLICATION_CREDENTIALS
-                    			gcloud config set project $GCP_PROJECT_ID
-		       
-                    			echo Configuring Docker to use gcloud credentials...
-                    			gcloud auth configure-docker us-docker.pkg.dev --quiet
-    				'''
-				script {
-					sh '''
-						gcloud artifacts repositories create java-app-repo-${IMAGE_TAG} --repository-format=docker --location=us --description="Docker repository" --project=$GCP_PROJECT_ID
-     					'''
-					sh "docker tag ${IMAGE_NAME}:${IMAGE_TAG} ${FULL_IMAGE_NAME}"
-					sh "docker push ${FULL_IMAGE_NAME}"
-					echo "Image pushed to: ${FULL_IMAGE_NAME}"
-				}
-			}
-		}
+                withCredentials([file(credentialsId: 'gcpjmsa', variable: 'GCP_KEY')]) {
+                    sh """
+                    gcloud auth activate-service-account --key-file=$GCP_KEY
+                    gcloud config set project $GCP_PROJECT_ID
+                    gcloud auth configure-docker us-docker.pkg.dev --quiet
+
+                    docker tag ${IMAGE_NAME}:${IMAGE_TAG} ${FULL_IMAGE_NAME}
+                    docker push ${FULL_IMAGE_NAME}
+                    """
+                }
             }
         }
-	stage('Deploy to Cloud Run') {
-		steps {
-			echo 'Deploying Image to Google Cloud Run'
-			withCredentials([file(credentialsId: 'gcpjmsa', variable: 'gcpCred')]) {
-    				withEnv(["GOOGLE_APPLICATION_CREDENTIALS=$gcpCred"]) {
-					sh '''
-						gcloud run deploy $SERVICE_NAME \
-            					--image=$FULL_IMAGE_NAME \
-            					--region=$REGION \
-            					--platform=managed \
-            					--allow-unauthenticated \
-		 				--port=8090 \
-            					--memory=512Mi \
-            					--quiet
-     					'''
-				}
-			}
-		}
-	}
-	stage('Get Cloud Run Service URL') {
+
+        stage('Deploy to Cloud Run') {
             steps {
-			echo 'Getting Cloud Run Service URL'
-		    	withCredentials([file(credentialsId: 'gcpjmsa', variable: 'gcpCred')]) {
-    				withEnv(["GOOGLE_APPLICATION_CREDENTIALS=$gcpCred"]) {
-					sh '''
-                    				SERVICE_URL=$(gcloud run services describe $SERVICE_NAME \
-                        				--platform managed \
-                        				--region $REGION \
-                        				--format="value(status.url)")
-			    			echo "Service deployed successfully!"
-                        			echo "Service URL: $SERVICE_URL"
-                			'''
-					}
-				}
-            		}
-       	 	}
-	}
+                withCredentials([file(credentialsId: 'gcpjmsa', variable: 'GCP_KEY')]) {
+                    sh """
+                    gcloud run deploy $SERVICE_NAME \
+                      --image=$FULL_IMAGE_NAME \
+                      --region=$REGION \
+                      --platform=managed \
+                      --allow-unauthenticated \
+                      --port=8090 \
+                      --memory=512Mi \
+                      --quiet
+                    """
+                }
+            }
+        }
+
+        stage('Get Service URL') {
+            steps {
+                sh """
+                gcloud run services describe $SERVICE_NAME \
+                  --region $REGION \
+                  --format='value(status.url)'
+                """
+            }
+        }
+    }
 }
